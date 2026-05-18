@@ -1,0 +1,33 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets
+.env
+config.json
+
+# Runtime
+server.log
+server.log.*
+command.json
+command.json.processing
+restart_error.txt
+voices.txt
+*.wav
+*.tmp
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Scripts
+push-to-github.sh
+
+# PID
+server.pid
+server.pid.tmp

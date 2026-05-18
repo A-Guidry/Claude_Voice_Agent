@@ -1,0 +1,12 @@
+# Levity Voice dependencies
+# Install: pip install -r requirements.txt
+
+# MCP server framework (all platforms)
+mcp>=1.27
+
+# macOS menu bar app (macOS only — skip on Windows/Linux)
+rumps>=0.4; sys_platform == 'darwin'
+
+# macOS Python-ObjC bridge (required by rumps)
+pyobjc-core>=12.0; sys_platform == 'darwin'
+pyobjc-framework-Cocoa>=12.0; sys_platform == 'darwin'
