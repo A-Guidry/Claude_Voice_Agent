@@ -14,13 +14,14 @@
 - The menubar app (`menubar.py`) must be launched with the venv python (`~/.levity-voice/venv/bin/python`), NOT system `python3` (rumps/AppKit aren't installed there).
 
 ## Architecture
-- **TTS-only mode** — voice input is handled by macOS Dictation or Claude's built-in voice input
-- `server.py` — MCP server providing voice_speak and voice_toggle tools
+- `server.py` — MCP server providing voice_speak, voice_toggle, voice_confirm, and voice_listen tools
 - `menubar.py` — macOS menu bar app (separate process), communicates via file IPC:
   - Reads `config.json` for status display
   - Writes `command.json` for one-shot commands (server deletes after processing)
 - Command watcher polls `command.json` every 0.5s
 - Two-tier TTS: macOS `say` for short text (<200 chars), Gemini 2.5 Flash TTS for longer text
+- STT: Whisper-based voice capture (voice_confirm / voice_listen tools)
+- Multi-host daemon: `multi-host/levity_voiced.py` — shared daemon over a Unix socket so multiple MCP hosts share one audio engine. Shims (`multi-host/levity_shim.py`) forward requests to it.
 
 ## Key File Paths
 - Config: `~/.levity-voice/config.json`

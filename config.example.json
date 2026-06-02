@@ -2,5 +2,8 @@
   "server_active": false,
   "response_active": true,
   "local_voice": "Samantha",
-  "gemini_voice": "Kore"
+  "gemini_voice": "Kore",
+  "whisper_model": "base",
+  "listen_mode": "quick",
+  "auto_menubar": true
 }

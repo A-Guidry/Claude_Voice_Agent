@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Levity Voice menu bar app — quick toggles for the MCP server.
+"""Levity Voice menu bar app — quick toggles for the MCP server (macOS).
 
 Communicates with the MCP server via two files in ~/.levity-voice/:
   - config.json   — status (read every 2s to refresh the menu)
   - command.json  — one-shot commands (written on user click; server deletes after)
 
-The menu bar app is its own process; quitting it does not stop the MCP server.
+Supported commands match the cross-platform TTS server:
+  start, stop, response_on, response_off, restart, mode_quick, mode_full.
 
-Note: Commands use last-writer-wins semantics. If two menu clicks happen
-faster than the server's 0.5s polling interval, only the last one is processed.
+The menu bar app is its own process; quitting it does not stop the MCP server.
 """
 
+import datetime
 import json
-import signal
+import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 import rumps
@@ -22,22 +24,30 @@ import rumps
 CONFIG_DIR = Path.home() / ".levity-voice"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 COMMAND_FILE = CONFIG_DIR / "command.json"
+MENUBAR_PID_FILE = CONFIG_DIR / "menubar.pid"
+MENUBAR_LOG = CONFIG_DIR / "menubar.log"
+# Optional custom status-bar icon (template PNG). Falls back to an emoji title.
+ICON_FILE = CONFIG_DIR / "levity-icon.png"
+
+
+def _log(msg: str) -> None:
+    try:
+        with open(MENUBAR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    except OSError:
+        pass
 
 LAUNCH_AGENT_LABEL = "com.levity.voice.menubar"
 LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 
 ICON_OFF = "🎙✕"
-ICON_ON = "🎙"
+ICON_IDLE = "🎙"
 
 POLL_INTERVAL_SEC = 2.0
 
 
 def _write_command(action: str) -> None:
-    """Write a one-shot command for the MCP server to consume.
-
-    Uses atomic write (tmp + rename) to prevent partial reads.
-    Last-writer-wins if commands arrive faster than the server polls.
-    """
+    """Write a one-shot command for the MCP server to consume."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp = COMMAND_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps({"action": action}))
@@ -73,28 +83,89 @@ def _launch_agent_plist() -> str:
         "    <key>RunAtLoad</key>\n"
         "    <true/>\n"
         "    <key>KeepAlive</key>\n"
-        "    <dict>\n"
-        "        <key>SuccessfulExit</key>\n"
-        "        <false/>\n"
-        "    </dict>\n"
+        "    <false/>\n"
         "</dict>\n"
         "</plist>\n"
     )
 
 
+def _already_running() -> bool:
+    """Single-instance guard: True only if another *menu-bar* process is live.
+
+    Verifies the PID actually belongs to a menubar.py process (via `ps`) so a
+    reused/stale PID can't wrongly block startup.
+    """
+    try:
+        pid = int(MENUBAR_PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        pid = 0
+    if pid and pid != os.getpid():
+        try:
+            os.kill(pid, 0)  # exists?
+            out = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            if "menubar.py" in out:
+                return True  # a real, live menu-bar instance
+        except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired, OSError):
+            pass
+    try:
+        MENUBAR_PID_FILE.write_text(str(os.getpid()))
+    except OSError:
+        pass
+    return False
+
+
+def _hide_dock_icon() -> None:
+    """Run as a menu-bar accessory (no Dock icon / no Python rocket)."""
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
+        _log("hide_dock_icon: set accessory policy OK")
+    except Exception as exc:
+        _log(f"hide_dock_icon: FAILED {exc!r}")
+
+
 class LevityVoiceApp(rumps.App):
     def __init__(self):
-        super().__init__(name="LevityVoice", title=ICON_OFF, quit_button=None)
+        # Use the Levity logo as a template status-bar icon if present;
+        # otherwise fall back to the emoji title.
+        icon = str(ICON_FILE) if ICON_FILE.exists() else None
+        # Logo-only when the icon is present; fall back to an emoji title if not.
+        super().__init__(
+            name="LevityVoice",
+            title=None if icon else ICON_OFF,
+            icon=icon,
+            template=True,
+            quit_button=None,
+        )
+        self._has_icon = icon is not None
+
+        # Response Mode (at the top): Quick = yes/no, Full = free-form transcript.
+        # Two top-level checkable items (more reliable than a submenu in rumps),
+        # under a disabled header that acts as the section label.
+        self.mode_header = rumps.MenuItem("Response Mode")  # no callback = header
+        self.mode_quick_item = rumps.MenuItem("  Quick (Yes / No)", callback=self.set_mode_quick)
+        self.mode_full_item = rumps.MenuItem("  Full (Free-form)", callback=self.set_mode_full)
 
         self.server_item = rumps.MenuItem("Server: OFF", callback=self.toggle_server)
         self.response_item = rumps.MenuItem("Voice Response: ON", callback=self.toggle_response)
+        self.restart_item = rumps.MenuItem("Restart Server", callback=self.restart_server)
         self.launch_item = rumps.MenuItem("Launch at Login", callback=self.toggle_launch_at_login)
         self.quit_item = rumps.MenuItem("Quit", callback=self.quit_app)
 
         self.menu = [
-            self.server_item,
+            self.mode_header,
+            self.mode_quick_item,
+            self.mode_full_item,
             None,
+            self.server_item,
             self.response_item,
+            None,
+            self.restart_item,
             None,
             self.launch_item,
             None,
@@ -117,14 +188,23 @@ class LevityVoiceApp(rumps.App):
 
         server = bool(cfg.get("server_active"))
         resp = bool(cfg.get("response_active", True))
+        mode = cfg.get("listen_mode", "quick")
 
-        self.title = ICON_ON if server else ICON_OFF
+        # Without a custom icon, show server state via an emoji title.
+        if not self._has_icon:
+            self.title = ICON_IDLE if server else ICON_OFF
+
+        # Reflect the current response mode (radio-style checkmarks).
+        self.mode_quick_item.state = 1 if mode == "quick" else 0
+        self.mode_full_item.state = 1 if mode == "full" else 0
 
         self.server_item.title = f"Server: {'ON' if server else 'OFF'}"
         self.server_item.state = 1 if server else 0
 
         self.response_item.title = f"Voice Response: {'ON' if resp else 'OFF'}"
         self.response_item.state = 1 if resp else 0
+
+        self.restart_item.set_callback(self.restart_server if server else None)
 
         self.launch_item.state = 1 if LAUNCH_AGENT_PATH.exists() else 0
 
@@ -135,6 +215,22 @@ class LevityVoiceApp(rumps.App):
     def toggle_response(self, _sender) -> None:
         cur = bool(self._last_cfg.get("response_active", True))
         _write_command("response_off" if cur else "response_on")
+
+    def restart_server(self, _sender) -> None:
+        _write_command("restart")
+
+    def set_mode_quick(self, _sender) -> None:
+        _write_command("mode_quick")
+        # Optimistic UI update so the checkmark moves instantly.
+        self.mode_quick_item.state = 1
+        self.mode_full_item.state = 0
+        self._last_cfg = {}  # force a real refresh on next tick
+
+    def set_mode_full(self, _sender) -> None:
+        _write_command("mode_full")
+        self.mode_quick_item.state = 0
+        self.mode_full_item.state = 1
+        self._last_cfg = {}
 
     def toggle_launch_at_login(self, _sender) -> None:
         if LAUNCH_AGENT_PATH.exists():
@@ -160,46 +256,30 @@ class LevityVoiceApp(rumps.App):
         self._refresh()
 
     def quit_app(self, _sender) -> None:
-        # Clean up any stale temp files before quitting
-        for tmp in CONFIG_DIR.glob("*.json.tmp"):
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
         rumps.quit_application()
 
 
-_should_quit = False
-
-
-def _handle_signal(signum, _frame):
-    """Handle SIGTERM/SIGINT: set quit flag.
-
-    Signal handlers must not call ObjC methods directly (rumps.quit_application
-    dispatches through the Cocoa run loop). Instead, set a flag and let the
-    rumps timer pick it up on the next tick.
-    """
-    global _should_quit
-    _should_quit = True
-
-
-class LevityVoiceAppWithSignal(LevityVoiceApp):
-    """Subclass that checks the quit flag on each timer tick."""
-
-    def _tick(self, _sender) -> None:
-        if _should_quit:
-            # Clean up temp files, then quit via the Cocoa run loop (safe)
-            for tmp in CONFIG_DIR.glob("*.json.tmp"):
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-            rumps.quit_application()
-            return
-        self._refresh()
-
-
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
-    LevityVoiceAppWithSignal().run()
+    try:
+        _tty = sys.stdin.isatty()
+    except Exception:
+        _tty = False
+    _log(f"=== menubar starting (pid {os.getpid()}, ppid {os.getppid()}, "
+         f"tty={_tty}, launched-by={'terminal' if _tty else 'app/agent'}) ===")
+    try:
+        if _already_running():
+            _log("another instance already running -> exiting")
+            sys.exit(0)
+        _log(f"icon file exists: {ICON_FILE.exists()}")
+        _hide_dock_icon()
+        app = LevityVoiceApp()
+        _log("LevityVoiceApp constructed OK")
+        _hide_dock_icon()  # re-assert after rumps initializes NSApplication
+        _log("entering rumps run loop")
+        app.run()
+        _log("run loop returned")
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        _log("CRASH: " + repr(exc) + "\n" + traceback.format_exc())
+        raise

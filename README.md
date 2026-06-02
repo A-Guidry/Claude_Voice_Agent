@@ -1,17 +1,18 @@
 # Levity Voice
 
-A lightweight MCP server that gives Claude Desktop a voice. Every response is spoken aloud using a two-tier TTS system: local system TTS for short/fast replies, and Gemini 2.5 Flash TTS for longer, more natural-sounding speech.
+A lightweight MCP server that gives Claude Desktop a voice. Every response is spoken aloud using a two-tier TTS system: local system TTS for short/fast replies, and Gemini 2.5 Flash TTS for longer, more natural-sounding speech. Also supports voice input via Whisper STT for yes/no confirmations and free-form transcription.
 
 Works on **macOS**, **Windows 11**, and **Linux**.
 
 ## Features
 
 - **Two-tier TTS** — short text (<200 chars) uses your system's built-in TTS for instant playback; longer text uses Google Gemini 2.5 Flash TTS for high-quality, natural speech
+- **Voice input (STT)** — Whisper-based microphone capture for confirmations (`voice_confirm`) and free-form listening (`voice_listen`)
 - **Cross-platform** — macOS (`say`/`afplay`), Windows (`System.Speech.Synthesis`), and Linux (`espeak-ng`/`aplay`)
 - **Stale instance management** — PID lock file detects and cleans up orphaned server processes on startup
-- **Menu bar app** (macOS) — toggle the server and voice responses from the macOS menu bar
-- **Zero dependencies on voice input** — works with macOS Dictation, Claude's built-in voice input, or a dedicated dictation app like [DictaFlow](https://dictaflow.app)
-- **File-based IPC** — the MCP server and menu bar app communicate via atomic file operations (no sockets, no daemons)
+- **Menu bar app** (macOS) — toggle the server, voice responses, and listen mode from the macOS menu bar
+- **Hooks** — shell scripts in `hooks/` that fire on server events (e.g. suppress double-speaking after Claude Code stop)
+- **Multi-host daemon** — optional `multi-host/` mode shares one audio engine across Claude Desktop and Antigravity via a Unix-domain socket, so both apps use the same coordinated voice
 - **Launch at login** — optional LaunchAgent integration (macOS)
 
 ## Requirements
@@ -26,6 +27,10 @@ Works on **macOS**, **Windows 11**, and **Linux**.
 | **macOS** | `say` (built-in) | `afplay` (built-in) | None |
 | **Windows 11** | `System.Speech.Synthesis` (built-in) | `System.Media.SoundPlayer` (built-in) | None |
 | **Linux** | `espeak-ng` or `espeak` | `aplay`, `paplay`, or `ffplay` | `sudo apt install espeak-ng` |
+
+### Voice input (STT) — optional
+
+`voice_confirm` and `voice_listen` require `sounddevice`, `numpy`, and `openai-whisper` (included in `requirements.txt`). Whisper runs locally — no API key needed for STT.
 
 ## Installation
 
@@ -125,7 +130,7 @@ cp .env.example .env
 # Edit .env and add your key (get one at https://aistudio.google.com/apikey)
 ```
 
-Without a key, everything still works — it just uses macOS `say` for all text.
+Without a key, everything still works — it just uses local TTS for all text.
 
 ### Optional: Menu bar app (macOS only)
 
@@ -136,15 +141,11 @@ The menu bar app requires macOS (it uses `rumps` and Cocoa frameworks). On Windo
 nohup ~/.levity-voice/venv/bin/python ~/.levity-voice/menubar.py &>/dev/null &
 ```
 
-The menu bar icon lets you toggle the server and voice responses. You can also enable "Launch at Login" from the menu.
+The menu bar icon lets you toggle the server, voice responses, and listen mode. You can also enable "Launch at Login" from the menu.
 
-### Recommended: DictaFlow for voice input
+### Optional: Multi-host daemon
 
-Levity Voice handles speech *output* only — for voice *input*, we recommend [DictaFlow](https://dictaflow.app). DictaFlow is a macOS dictation app that lets you speak directly into any text field, including the Claude Desktop chat box. It provides faster, more accurate transcription than the built-in macOS Dictation and works system-wide with a configurable hotkey.
-
-With Levity Voice + DictaFlow, you get a fully hands-free conversational loop: speak your prompt via DictaFlow, Claude responds in text, and Levity Voice reads the response back to you.
-
-macOS Dictation (built-in, free) and Claude's native voice input also work fine if you prefer not to install another app.
+If you run both Claude Desktop and another MCP host (e.g. Antigravity), the `multi-host/` daemon shares one audio engine between them — one voice, no overlap. See `multi-host/README.md` for setup.
 
 ## Architecture
 
@@ -153,17 +154,29 @@ macOS Dictation (built-in, free) and Claude's native voice input also work fine 
 │   server.py     │◄────────(read every 0.5s)────►│   menubar.py    │
 │   (MCP server)  │                               │ (macOS only)    │
 │                 │◄──── command.json (write) ─────│                 │
-│   voice_speak   │         (atomic rename)        │   menu toggles  │
-│   voice_toggle  │                               │   launch agent  │
-└─────────────────┘                               └─────────────────┘
+│  voice_speak    │         (atomic rename)        │   menu toggles  │
+│  voice_toggle   │                               │   launch agent  │
+│  voice_confirm  │                               └─────────────────┘
+│  voice_listen   │
+└─────────────────┘
         │
         ├── short text ──► System TTS (say / SAPI / espeak)
-        └── long text  ──► Gemini 2.5 Flash TTS ──► Audio playback
+        ├── long text  ──► Gemini 2.5 Flash TTS ──► Audio playback
+        └── mic input  ──► Whisper STT ──► text transcript
+
+Multi-host (optional):
+┌────────────┐  Unix socket  ┌───────────────────┐
+│ levity_shim│──────────────►│ levity_voiced.py  │
+│  (per host)│               │  (shared daemon)  │
+└────────────┘               │  owns mic + TTS   │
+                             └───────────────────┘
 ```
 
-- **server.py** — FastMCP server exposing `voice_speak` and `voice_toggle` tools. Runs inside Claude Desktop's MCP host. Cross-platform: detects macOS/Windows/Linux and uses the appropriate TTS and audio playback backends. Includes PID lock file management to prevent stale instances.
+- **server.py** — FastMCP server exposing `voice_speak`, `voice_toggle`, `voice_confirm`, and `voice_listen` tools. Runs inside Claude Desktop's MCP host. Cross-platform: detects macOS/Windows/Linux and uses the appropriate TTS and audio playback backends. Includes PID lock file management to prevent stale instances.
 - **menubar.py** — standalone macOS menu bar app using `rumps`. Reads `config.json` for display, writes `command.json` for one-shot commands. macOS only — on other platforms, use the `voice_toggle` MCP tool directly.
-- Communication is file-based IPC with atomic writes (tmp + rename) to prevent partial reads.
+- **hooks/** — shell scripts that fire on server events. The included `stop` hook prevents the daemon from double-speaking a turn that the MCP server already voiced.
+- **multi-host/** — optional shared daemon (`levity_voiced.py`) and per-host shim (`levity_shim.py`). Multiple MCP hosts share one microphone and one TTS engine over a Unix-domain socket.
+- Communication between server and menubar is file-based IPC with atomic writes (tmp + rename) to prevent partial reads.
 
 ## Configuration
 
@@ -171,20 +184,29 @@ Settings live in `~/.levity-voice/config.json` (created automatically on first r
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `server_active` | bool | `false` | Whether TTS is active |
+| `server_active` | bool | `false` | Whether TTS/STT is active |
 | `response_active` | bool | `true` | Whether `voice_speak` produces audio |
 | `local_voice` | string | `"Samantha"` | System voice name (macOS: `say -v ?`, Windows: see Speech settings, Linux: `espeak-ng --voices`) |
 | `gemini_voice` | string | `"Kore"` | Gemini TTS voice name |
+| `whisper_model` | string | `"base"` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large` |
+| `listen_mode` | string | `"quick"` | `"quick"` = yes/no confirmation, `"full"` = free-form transcript |
+| `auto_menubar` | bool | `true` | Auto-launch the menu bar app on server start (macOS only) |
 
 The Gemini API key is stored in `~/.levity-voice/.env` (never in `config.json`).
 
 ## MCP Tools
 
 ### `voice_speak(text, force_local=False)`
-Speak text aloud. Automatically chooses local or Gemini TTS based on text length.
+Speak text aloud. Automatically chooses local or Gemini TTS based on text length. Refuses if `server_active` is false.
 
 ### `voice_toggle(action)`
 Control server state. Actions: `start`, `stop`, `response_on`, `response_off`, `status`.
+
+### `voice_confirm(timeout=5.0)`
+Record a short yes/no reply from the microphone and return `{"decision": "yes"|"no"|"unclear", "transcript": "..."}`. Requires `server_active`.
+
+### `voice_listen(timeout=30.0)`
+Record free-form speech and return the Whisper transcript. Requires `server_active`.
 
 ## License
 

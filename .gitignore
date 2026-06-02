@@ -11,15 +11,24 @@ config.json
 # Runtime
 server.log
 server.log.*
+menubar.log
+voiced.log
 command.json
 command.json.processing
 restart_error.txt
 voices.txt
+last_spoken.json
+voiced.sock
 *.wav
 *.tmp
 
+# Backups
+*.bak
+*.bak-*
+
 # macOS
 .DS_Store
+Levity Voice.app/
 
 # IDE
 .vscode/
@@ -31,3 +40,5 @@ push-to-github.sh
 # PID
 server.pid
 server.pid.tmp
+menubar.pid
+voiced.pid

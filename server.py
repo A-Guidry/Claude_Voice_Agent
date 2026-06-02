@@ -25,11 +25,13 @@ Rules:
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import logging.handlers
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -47,6 +49,10 @@ from mcp.server.fastmcp import FastMCP
 # Section 1 — Platform detection, constants, logging, .env
 # ---------------------------------------------------------------------------
 
+# Build stamp — surfaced in voice_toggle("status") so you can confirm which
+# code the running process actually loaded (useful after a self-restart).
+BUILD = "2026-06-02.7-server-launches-menubar"
+
 PLATFORM = platform.system()  # "Darwin", "Windows", or "Linux"
 IS_MACOS = PLATFORM == "Darwin"
 IS_WINDOWS = PLATFORM == "Windows"
@@ -55,6 +61,19 @@ IS_LINUX = PLATFORM == "Linux"
 LOCAL_TTS_THRESHOLD = 200
 MAX_AUDIO_BYTES = 50 * 1024 * 1024      # 50 MB decoded audio cap
 MAX_RESPONSE_BYTES = 100 * 1024 * 1024   # 100 MB raw API response cap
+
+# Speech capture (Whisper STT, cross-platform).
+DEFAULT_WHISPER_MODEL = "base"
+CONFIRM_MAX_SEC = 5.0          # hard cap on a quick yes/no recording
+CONFIRM_SILENCE_SEC = 1.2      # stop this soon after the speaker pauses (quick)
+LISTEN_MAX_SEC = 30.0          # hard cap on a full free-form recording
+LISTEN_SILENCE_SEC = 2.0       # longer pause tolerance for full sentences
+MIC_SAMPLE_RATE = 16000        # what Whisper expects natively
+MIC_BLOCK_SIZE = 1024
+SILENCE_RMS_THRESHOLD = 0.01
+# listen_mode is a user preference (set from the menu bar): "quick" = yes/no,
+# "full" = free-form transcript. Surfaced in status so the agent can honor it.
+LISTEN_MODES = ("quick", "full")
 
 if IS_MACOS:
     DEFAULT_LOCAL_VOICE = "Samantha"
@@ -69,6 +88,9 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 COMMAND_FILE = CONFIG_DIR / "command.json"
 PID_FILE = CONFIG_DIR / "server.pid"
 ENV_FILE = CONFIG_DIR / ".env"
+# Touched whenever voice_speak runs; the Claude Code Stop hook reads this to
+# avoid double-speaking a turn the model already voiced (see hooks/).
+LAST_SPOKEN_FILE = CONFIG_DIR / "last_spoken.json"
 
 # Shutdown flag — async-signal-safe (set by signal handler, polled by threads)
 _shutdown_flag = False
@@ -295,6 +317,12 @@ _CONFIG_SCHEMA = {
     "gemini_api_key":  (str,  ""),
     "local_voice":     (str,  DEFAULT_LOCAL_VOICE),
     "gemini_voice":    (str,  DEFAULT_GEMINI_VOICE),
+    "whisper_model":   (str,  DEFAULT_WHISPER_MODEL),
+    "listen_mode":     (str,  "quick"),
+    # On by default: the server launches the macOS menu bar itself (direct
+    # Python — the reliable method). A single-instance guard prevents duplicate
+    # icons across hosts. Set false to suppress it.
+    "auto_menubar":    (bool, True),
 }
 
 
@@ -491,6 +519,12 @@ def _speak_local(text: str, voice: str | None = None) -> str:
 def _speak_local_macos(text: str, voice: str) -> str:
     proc = _run_tts_subprocess(["say", "-v", voice], text_input=text)
     if proc.returncode != 0:
+        # A negative return code means `say` was killed by a signal — i.e. we
+        # interrupted it (SIGTERM) to start a newer utterance (interrupt /
+        # newest-wins). That is NOT a failure: re-speaking the cut-off text on
+        # the default voice would replay what we just silenced. Bail quietly.
+        if proc.returncode < 0:
+            return "Interrupted."
         log.warning("say -v %s failed (rc=%d), trying default", voice, proc.returncode)
         fallback = _run_tts_subprocess(["say"], text_input=text)
         if fallback.returncode != 0:
@@ -664,6 +698,214 @@ def _speak_gemini(text: str, api_key: str, gemini_voice: str,
 
 
 # ---------------------------------------------------------------------------
+# Section 4b — Spoken-response marker + background playback
+# ---------------------------------------------------------------------------
+
+
+def _write_last_spoken(text: str) -> None:
+    """Record that voice_speak ran so the Claude Code Stop hook can tell the
+    turn was already voiced and skip re-speaking it."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = LAST_SPOKEN_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"ts": time.time(), "chars": len(text)}, fh)
+        tmp.replace(LAST_SPOKEN_FILE)
+    except OSError:
+        pass
+
+
+def _speak_background(text: str, use_cloud: bool, api_key: str,
+                      gemini_voice: str, local_voice: str) -> None:
+    """Run the (blocking) TTS in a background thread so voice_speak can return
+    immediately — long replies must not keep the MCP request open long enough
+    to time out and silently drop the audio."""
+    try:
+        if use_cloud:
+            _speak_gemini(text, api_key, gemini_voice, local_voice)
+        else:
+            _speak_local(text, local_voice)
+    except Exception as exc:
+        log.error("background speak failed: %r", exc)
+
+
+# ---------------------------------------------------------------------------
+# Section 4c — Microphone capture + Whisper STT (for voice_confirm)
+# ---------------------------------------------------------------------------
+
+# Lazy-loaded heavy deps (only imported the first time voice_confirm runs).
+_np = None
+_sd = None
+_whisper = None
+_whisper_model = None
+_whisper_model_name: str | None = None
+_audio_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _silence_fd1():
+    """Redirect OS file descriptor 1 to /dev/null for the block.
+
+    PortAudio and Whisper can write diagnostics straight to fd 1, bypassing
+    sys.stdout. On a stdio MCP transport any stray byte on fd 1 corrupts the
+    protocol, so we mute it around audio/model calls. Cross-platform: os.dup /
+    os.dup2 work on fds on macOS, Linux, and Windows.
+    """
+    sys.stdout.flush()
+    try:
+        saved = os.dup(1)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        yield
+        return
+    try:
+        os.dup2(devnull, 1)
+        os.close(devnull)
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
+def _ensure_audio() -> None:
+    """Import numpy / sounddevice / whisper on first use."""
+    global _np, _sd, _whisper
+    if _np is None:
+        import numpy
+        _np = numpy
+    if _sd is None:
+        with _silence_fd1():
+            import sounddevice
+        _sd = sounddevice
+    if _whisper is None:
+        with _silence_fd1():
+            import whisper
+        _whisper = whisper
+
+
+def _load_whisper():
+    """Load (and cache) the Whisper model named in config."""
+    global _whisper_model, _whisper_model_name
+    name = _get_config_snapshot().get("whisper_model", DEFAULT_WHISPER_MODEL)
+    if _whisper_model is None or _whisper_model_name != name:
+        with _silence_fd1():
+            _whisper_model = _whisper.load_model(name)
+        _whisper_model_name = name
+    return _whisper_model
+
+
+def _wait_for_tts_idle(timeout: float = 30.0) -> None:
+    """Block until no TTS playback is active, so a spoken question finishes
+    before voice_confirm opens the mic (otherwise Whisper records the
+    assistant's own voice). Capped at `timeout` seconds."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with _tts_proc_lock:
+            busy = _tts_process is not None
+        if not busy:
+            return
+        time.sleep(0.05)
+
+
+def _record_audio(window: float, silence_sec: float) -> str:
+    """Record an utterance (cap = window, early-stop after `silence_sec` of
+    silence) and transcribe it with Whisper. Returns the transcript ('' if
+    nothing). Used by both voice_confirm (quick) and voice_listen (full)."""
+    _ensure_audio()
+    model = _load_whisper()
+
+    # Let any in-flight spoken question finish, then a short settle, so we
+    # don't capture our own TTS through the mic.
+    _wait_for_tts_idle()
+    time.sleep(0.15)
+
+    frames: list = []
+    state = {"last_voice": time.time(), "spoke": False, "start": time.time()}
+    cb_lock = threading.Lock()
+
+    def _cb(indata, _n, _t, _status):
+        with cb_lock:
+            frames.append(indata.copy())
+            rms = float(_np.sqrt(_np.mean(indata.astype(_np.float32) ** 2)))
+            if rms > SILENCE_RMS_THRESHOLD:
+                state["last_voice"] = time.time()
+                state["spoke"] = True
+
+    with _silence_fd1():
+        stream = _sd.InputStream(
+            samplerate=MIC_SAMPLE_RATE, channels=1, dtype="float32",
+            blocksize=MIC_BLOCK_SIZE, callback=_cb,
+        )
+        stream.start()
+    try:
+        while True:
+            time.sleep(0.05)
+            now = time.time()
+            with cb_lock:
+                elapsed = now - state["start"]
+                silence = (now - state["last_voice"]) if state["spoke"] else 0.0
+                spoke = state["spoke"]
+            if elapsed >= window or (spoke and silence >= silence_sec):
+                break
+    finally:
+        with _silence_fd1():
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+    with cb_lock:
+        chunks = list(frames)
+    if not chunks:
+        return ""
+    audio = _np.concatenate(chunks, axis=0).flatten().astype(_np.float32)
+    try:
+        with _silence_fd1():
+            result = model.transcribe(audio, fp16=False, language="en")
+        return (result.get("text") or "").strip()
+    except Exception as exc:
+        log.error("transcription failed: %r", exc)
+        return ""
+
+
+# Confirmation intent parsing.
+_CONFIRM_POS_WORDS = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "approve", "approved",
+    "go", "confirm", "confirmed", "affirmative", "accept", "accepted",
+    "proceed", "definitely", "absolutely", "correct", "right",
+}
+_CONFIRM_NEG_WORDS = {
+    "no", "nope", "nah", "deny", "denied", "reject", "rejected", "stop",
+    "cancel", "cancelled", "negative", "abort", "never", "dont", "wait",
+}
+
+
+def _parse_confirmation(text: str) -> str:
+    """Classify a transcription as 'yes', 'no', or 'unclear'.
+
+    Callers should treat anything other than 'yes' as "do not proceed".
+    """
+    lowered = (text or "").lower().replace("'", "").replace("’", "")
+    compact = " ".join(re.sub(r"[^a-z\s]", " ", lowered).split())
+    if not compact:
+        return "unclear"
+    words = set(compact.split())
+    has_neg = bool(words & _CONFIRM_NEG_WORDS) or "do not" in compact
+    has_pos = (
+        bool(words & _CONFIRM_POS_WORDS)
+        or "go ahead" in compact
+        or "do it" in compact
+        or "sounds good" in compact
+    )
+    if has_neg and not has_pos:
+        return "no"
+    if has_pos and not has_neg:
+        return "yes"
+    return "unclear"
+
+
+# ---------------------------------------------------------------------------
 # Section 5 — MCP tools
 # ---------------------------------------------------------------------------
 
@@ -673,7 +915,11 @@ mcp = FastMCP(
         "MANDATORY: You MUST call voice_speak at the end of EVERY response. "
         "The user relies on voice output for all interactions. Speak a natural "
         "summary of your response — if the response is long or contains code, "
-        "summarize the key points for the spoken version. Never skip this."
+        "summarize the key points for the spoken version. Never skip this. "
+        "When you need input, call voice_speak to ASK aloud, then capture the "
+        "reply: voice_confirm for a yes/no decision, or voice_listen for a "
+        "free-form answer. Honor the user's listen_mode in status ('quick' favors "
+        "voice_confirm, 'full' favors voice_listen). Only act on a clear answer."
     ),
 )
 
@@ -719,23 +965,154 @@ async def voice_speak(text: str, force_local: bool = False) -> str:
 
     use_cloud = not force_local and bool(api_key) and len(text) >= LOCAL_TTS_THRESHOLD
 
-    if use_cloud:
-        return await asyncio.to_thread(
-            _speak_gemini, text, api_key, gemini_voice, local_voice
-        )
-    return await asyncio.to_thread(_speak_local, text, local_voice)
+    # Record immediately (before playback) so the Stop hook sees this turn as
+    # already voiced even while audio is still playing.
+    _write_last_spoken(text)
+
+    # Interrupt any in-flight speech, then play in the BACKGROUND and return
+    # right away. Blocking until `say`/Gemini finished reading a long reply is
+    # what made the MCP request time out and silently drop the spoken response.
+    _kill_active_tts()
+    threading.Thread(
+        target=_speak_background,
+        args=(text, use_cloud, api_key, gemini_voice, local_voice),
+        daemon=True, name="levity-speak",
+    ).start()
+
+    engine = "Gemini TTS" if use_cloud else "local voice"
+    return f"Speaking via {engine} (playback started)."
+
+
+@mcp.tool(
+    name="voice_confirm",
+    annotations={
+        "title": "Voice Confirm",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def voice_confirm(timeout_seconds: float = 5.0) -> str:
+    """Ask the user for a quick spoken yes/no and return their decision.
+
+    Use this whenever you need approval before doing something — running a
+    command, editing files, any "should I proceed?" moment. First call
+    voice_speak to ASK the question aloud, THEN call voice_confirm to capture
+    the answer. Recording auto-stops a moment after the user pauses, or at
+    timeout_seconds (default 5, capped 2-15). Cross-platform (Whisper STT).
+
+    Returns JSON: {"decision": "yes"|"no"|"unclear", "transcript": "..."}.
+    Only proceed when decision == "yes". Treat "no" and "unclear" as
+    "do not proceed"; on "unclear" you may ask again.
+
+    Args:
+        timeout_seconds: Max seconds to listen (clamped to 2-15).
+
+    Returns:
+        str: JSON with the parsed decision and raw transcript.
+    """
+    snap = _get_config_snapshot()
+    if not snap.get("server_active", False):
+        return json.dumps({
+            "decision": "unclear", "transcript": "",
+            "error": "Server inactive. Call voice_toggle('start') first.",
+        })
+
+    try:
+        window = float(timeout_seconds)
+    except (TypeError, ValueError):
+        window = CONFIRM_MAX_SEC
+    window = max(2.0, min(window, 15.0))
+
+    # One capture at a time.
+    if not _audio_lock.acquire(blocking=False):
+        return json.dumps({
+            "decision": "unclear", "transcript": "",
+            "error": "Already listening — wait for the current capture to finish.",
+        })
+    try:
+        text = await asyncio.to_thread(_record_audio, window, CONFIRM_SILENCE_SEC)
+    except Exception as exc:
+        log.error("voice_confirm failed: %r", exc)
+        return json.dumps({
+            "decision": "unclear", "transcript": "",
+            "error": f"Listen failed: {exc}",
+        })
+    finally:
+        _audio_lock.release()
+
+    decision = _parse_confirmation(text)
+    log.info("voice_confirm: decision=%s transcript=%r", decision, text)
+    return json.dumps({"decision": decision, "transcript": text})
+
+
+@mcp.tool(
+    name="voice_listen",
+    annotations={
+        "title": "Voice Listen",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def voice_listen(timeout_seconds: float = 30.0) -> str:
+    """Listen for a full, free-form spoken reply and return the transcript.
+
+    The open-ended counterpart to voice_confirm: use this when you need more
+    than yes/no — the user can say anything ("let's go with option A", a
+    sentence, etc.). First call voice_speak to ASK aloud, THEN voice_listen.
+    Recording auto-stops after a ~2s pause, or at timeout_seconds (default 30,
+    capped 3-60). Cross-platform (Whisper STT).
+
+    Returns the transcribed text, or "(no speech detected)".
+
+    Tip: the user's preferred input style is in voice_toggle("status") as
+    "listen_mode" — "full" favors this tool, "quick" favors voice_confirm.
+
+    Args:
+        timeout_seconds: Max seconds to listen (clamped to 3-60).
+
+    Returns:
+        str: The transcribed speech, or a status message.
+    """
+    snap = _get_config_snapshot()
+    if not snap.get("server_active", False):
+        return "Server inactive. Call voice_toggle('start') first."
+
+    try:
+        window = float(timeout_seconds)
+    except (TypeError, ValueError):
+        window = LISTEN_MAX_SEC
+    window = max(3.0, min(window, 60.0))
+
+    if not _audio_lock.acquire(blocking=False):
+        return "Already listening — wait for the current capture to finish."
+    try:
+        text = await asyncio.to_thread(_record_audio, window, LISTEN_SILENCE_SEC)
+    except Exception as exc:
+        log.error("voice_listen failed: %r", exc)
+        return f"Listen failed: {exc}"
+    finally:
+        _audio_lock.release()
+
+    log.info("voice_listen: transcript=%r", text)
+    return text if text else "(no speech detected)"
 
 
 def _apply_toggle_action(action: str) -> str:
     """Synchronous toggle logic. Acquires _lock once, releases, then does I/O."""
     if action == "start":
         with _lock:
-            if _config.get("server_active"):
-                return "Server is already active."
+            already = _config.get("server_active")
             _config["server_active"] = True
             snapshot = dict(_config)
-        _save_config(snapshot)
-        return "Voice server started (TTS-only mode)."
+        if not already:
+            _save_config(snapshot)
+        # Bring up the menu bar too (idempotent: skipped if already running).
+        _maybe_launch_menubar()
+        return "Server is already active." if already else "Voice server started."
 
     if action == "stop":
         _kill_active_tts()
@@ -760,9 +1137,17 @@ def _apply_toggle_action(action: str) -> str:
         _save_config(snapshot)
         return "Voice responses silenced."
 
+    if action in ("mode_quick", "mode_full"):
+        mode = "quick" if action == "mode_quick" else "full"
+        with _lock:
+            _config["listen_mode"] = mode
+            snapshot = dict(_config)
+        _save_config(snapshot)
+        return f"Listen mode set to '{mode}'."
+
     return (
-        f"Unknown action: '{action}'. "
-        "Valid: start, stop, response_on, response_off, status"
+        f"Unknown action: '{action}'. Valid: start, stop, response_on, "
+        "response_off, mode_quick, mode_full, status"
     )
 
 
@@ -785,6 +1170,8 @@ async def voice_toggle(action: str) -> str:
             - "stop" — deactivate voice service
             - "response_on" — enable voice_speak audio playback
             - "response_off" — silence voice_speak
+            - "mode_quick" — prefer voice_confirm (yes/no) for input
+            - "mode_full" — prefer voice_listen (free-form) for input
             - "status" — return current state of all toggles
 
     Returns:
@@ -801,7 +1188,11 @@ async def voice_toggle(action: str) -> str:
                 "local_voice": snap.get("local_voice", DEFAULT_LOCAL_VOICE),
                 "gemini_voice": snap.get("gemini_voice", DEFAULT_GEMINI_VOICE),
                 "has_gemini_key": bool(snap.get("gemini_api_key")),
+                "whisper_model": snap.get("whisper_model", DEFAULT_WHISPER_MODEL),
+                "listen_mode": snap.get("listen_mode", "quick"),
+                "auto_menubar": snap.get("auto_menubar", True),
                 "platform": PLATFORM,
+                "build": BUILD,
             }, indent=2)
         return await asyncio.to_thread(_get_status)
 
@@ -961,16 +1352,41 @@ _command_watcher_thread: threading.Thread | None = None
 # ---------------------------------------------------------------------------
 
 
-def _auto_restore() -> None:
-    """If config says server_active, ensure in-memory state matches."""
-    time.sleep(3)  # let MCP event loop start
+def _maybe_launch_menubar() -> None:
+    """Launch the macOS menu-bar app on startup (opt-in via auto_menubar).
+
+    macOS-only (the menu bar needs rumps/pyobjc). Skips if one is already
+    running (pgrep) so multiple server instances don't spawn duplicate icons.
+    """
+    if not IS_MACOS:
+        log.info("menu-bar: skipped (not macOS)")
+        return
+    if not _get_config_snapshot().get("auto_menubar", True):
+        log.info("menu-bar: skipped (auto_menubar off)")
+        return
+    menubar = CONFIG_DIR / "menubar.py"
+    if not menubar.exists():
+        log.warning("menu-bar: skipped (menubar.py not found at %s)", menubar)
+        return
     try:
-        with _lock:
-            if _config.get("server_active", False):
-                log.info("auto-restoring server_active from config")
-                _config["server_active"] = True
-    except Exception as exc:
-        log.error("auto-restore failed: %r", exc)
+        existing = subprocess.run(
+            ["pgrep", "-f", str(menubar)], capture_output=True, text=True, timeout=5,
+        )
+        if existing.stdout.strip():
+            log.info("menu-bar: already running (pids %s); not launching",
+                     existing.stdout.split())
+            return
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(menubar)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log.info("menu-bar: launched via %s (child pid %d)", sys.executable, proc.pid)
+    except OSError as exc:
+        log.error("menu-bar: launch failed: %r", exc)
 
 
 def _graceful_shutdown(signum, _frame):
@@ -999,8 +1415,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _graceful_shutdown)
 
     _start_command_watcher()
-    threading.Thread(
-        target=_auto_restore, daemon=True, name="levity-auto-restore"
-    ).start()
+    _maybe_launch_menubar()
 
     mcp.run()
