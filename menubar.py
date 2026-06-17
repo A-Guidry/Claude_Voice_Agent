@@ -14,8 +14,10 @@ The menu bar app is its own process; quitting it does not stop the MCP server.
 import datetime
 import json
 import os
+import socket
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -26,6 +28,11 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 COMMAND_FILE = CONFIG_DIR / "command.json"
 MENUBAR_PID_FILE = CONFIG_DIR / "menubar.pid"
 MENUBAR_LOG = CONFIG_DIR / "menubar.log"
+# Shared voice daemon (multi-host mode). The menu bar and the daemon are a unit;
+# starting the menu bar ensures the daemon is up (and the daemon, in turn,
+# launches the menu bar — see levity_voiced.py).
+DAEMON_SOCKET = CONFIG_DIR / "voiced.sock"
+DAEMON_SCRIPT = CONFIG_DIR / "multi-host" / "levity_voiced.py"
 # Optional custom status-bar icon (template PNG). Falls back to an emoji title.
 ICON_FILE = CONFIG_DIR / "levity-icon.png"
 
@@ -62,6 +69,54 @@ def _read_config() -> dict:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def _daemon_socket_live() -> bool:
+    """True if the shared voice daemon's socket is accepting connections."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1)
+        s.connect(str(DAEMON_SOCKET))
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _ensure_daemon() -> None:
+    """Start the shared voice daemon if it isn't already running.
+
+    Mirrors the shim's _ensure_daemon: probe the socket, and if nothing answers,
+    spawn levity_voiced.py detached under this same (venv) interpreter. Makes the
+    menu bar a real entry point — its start/stop/restart commands need a daemon
+    to read command.json. Idempotent: a live socket means we leave it alone, so
+    this never races the daemon's own _maybe_launch_menubar into a double launch.
+    """
+    if _daemon_socket_live():
+        return
+    if not DAEMON_SCRIPT.exists():
+        _log(f"ensure_daemon: skipped (daemon not found at {DAEMON_SCRIPT})")
+        return
+    try:
+        daemon_log = open(CONFIG_DIR / "voiced.log", "a", encoding="utf-8")
+    except OSError:
+        daemon_log = subprocess.DEVNULL
+    try:
+        subprocess.Popen(
+            [sys.executable, str(DAEMON_SCRIPT)],
+            stdout=daemon_log, stderr=daemon_log,
+            start_new_session=True,
+        )
+        _log(f"ensure_daemon: launched daemon via {sys.executable}")
+    except OSError as exc:
+        _log(f"ensure_daemon: launch failed {exc!r}")
+        return
+    for _ in range(50):  # wait up to ~5s for the socket to come up
+        time.sleep(0.1)
+        if _daemon_socket_live():
+            _log("ensure_daemon: daemon socket is live")
+            return
+    _log("ensure_daemon: daemon did not come up within ~5s")
 
 
 def _launch_agent_plist() -> str:
@@ -270,6 +325,9 @@ if __name__ == "__main__":
         if _already_running():
             _log("another instance already running -> exiting")
             sys.exit(0)
+        # Bring the shared voice daemon up if it isn't already (no-op if a host
+        # has already spawned it). Keeps the menu bar + daemon working as a unit.
+        _ensure_daemon()
         _log(f"icon file exists: {ICON_FILE.exists()}")
         _hide_dock_icon()
         app = LevityVoiceApp()

@@ -62,17 +62,21 @@ Each host's MCP config points `levity-voice` at the shim instead of `server.py`:
 }
 ```
 
-Config locations (macOS):
+Config locations (macOS) and current wiring:
 
-| Host                | Config file                                                        |
-| ------------------- | ------------------------------------------------------------------ |
-| Claude Desktop      | `~/Library/Application Support/Claude/claude_desktop_config.json`  |
-| Antigravity (IDE)   | `~/.gemini/antigravity-ide/mcp_config.json`                        |
-| Antigravity (app)   | `~/.gemini/config/mcp_config.json`                                 |
+| Host                | Config file                                                        | Wired to    |
+| ------------------- | ------------------------------------------------------------------ | ----------- |
+| Antigravity (IDE)   | `~/.gemini/antigravity-ide/mcp_config.json`                        | shim ✅     |
+| Antigravity (app)   | `~/.gemini/config/mcp_config.json`                                 | shim ✅     |
+| Claude Desktop      | `~/Library/Application Support/Claude/claude_desktop_config.json`  | shim ✅     |
 
-All three are wired to the shim. After editing Claude Desktop's config, **quit
-and reopen Claude Desktop** so it reloads MCP and launches the shim (the daemon
-auto-starts on first call).
+All three hosts now run on the shared daemon. Claude Desktop was moved off the
+single-instance `server.py` (which suffered recurring MCP crashes from
+PortAudio/CoreAudio writing `||PaMacCor` diagnostics to fd 1 — the same fd the
+JSON-RPC transport uses) onto the shim. The shim owns no audio, so that stdout
+corruption can no longer reach Claude Desktop's transport; the daemon absorbs it
+instead. After editing the config, **quit and reopen Claude Desktop** so it
+reloads MCP and launches the shim.
 
 The daemon does not need to be started by hand — the first shim call spawns it.
 To run it manually for debugging:

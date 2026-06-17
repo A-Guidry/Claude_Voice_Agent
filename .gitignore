@@ -13,6 +13,8 @@ server.log
 server.log.*
 menubar.log
 voiced.log
+voiced.daemon.log
+menubar.console.log
 command.json
 command.json.processing
 restart_error.txt

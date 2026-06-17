@@ -86,12 +86,19 @@ def _dispatch(req: dict) -> dict:
         # rejected: backlogged speech goes stale fast in an interactive session.
         with _speak_lock:
             engine._write_last_spoken(text)
+            # Claim the newest-utterance generation (matches server.py's
+            # voice_speak) so _speak_background doesn't bail thinking it was
+            # superseded. Missing this arg crashed the speak thread silently.
+            with engine._speak_gen_lock:
+                engine._speak_gen += 1
+                my_gen = engine._speak_gen
             engine._kill_active_tts()
             threading.Thread(
                 target=engine._speak_background,
                 args=(text, use_cloud, api_key,
                       snap.get("gemini_voice", engine.DEFAULT_GEMINI_VOICE),
-                      snap.get("local_voice", engine.DEFAULT_LOCAL_VOICE)),
+                      snap.get("local_voice", engine.DEFAULT_LOCAL_VOICE),
+                      my_gen),
                 daemon=True,
             ).start()
         return {"ok": True, "result": "Speaking (daemon)."}
@@ -171,6 +178,25 @@ def main() -> int:
     os.chmod(SOCKET_PATH, 0o600)  # user-only
     srv.listen(8)
     sys.stderr.write(f"[levity-voiced] listening on {SOCKET_PATH}\n")
+
+    # In multi-host mode the daemon is the long-lived hub, so it takes over the
+    # two roles server.py's __main__ plays in single-instance mode:
+    #   1. the command-file watcher — so the menu bar's command.json writes
+    #      (start/stop/restart/mode) are actually processed; otherwise the menu
+    #      bar's buttons would silently do nothing under the daemon.
+    #   2. launching the menu bar — so starting the daemon brings up the menu
+    #      bar (gated on auto_menubar; idempotent via pgrep).
+    # Together with the menu bar's own _ensure_daemon(), this makes the two
+    # processes a unit no matter which one starts first. Glue failures here must
+    # never take the audio daemon down, so they're caught and logged.
+    try:
+        engine._start_command_watcher()
+        engine._maybe_launch_menubar()
+    except Exception as exc:  # pragma: no cover - defensive
+        sys.stderr.write(
+            f"[levity-voiced] menubar/command-watcher init failed: {exc!r}\n"
+        )
+
     try:
         while True:
             conn, _ = srv.accept()

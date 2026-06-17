@@ -42,6 +42,11 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+try:
+    import fcntl  # Unix-only; used to serialize the startup PID critical section
+except ImportError:  # Windows
+    fcntl = None
+
 from mcp.server.fastmcp import FastMCP
 
 
@@ -52,6 +57,14 @@ from mcp.server.fastmcp import FastMCP
 # Build stamp — surfaced in voice_toggle("status") so you can confirm which
 # code the running process actually loaded (useful after a self-restart).
 BUILD = "2026-06-02.7-server-launches-menubar"
+
+# Wall-clock time the process booted; surfaced as "uptime" in
+# voice_toggle("status"). Set at import (i.e. process start).
+_server_started_at = time.time()
+
+# Auto-restart ceiling: a process running longer than this re-execs itself to
+# refresh (long-lived TTS/audio state can drift over many days). Tune freely.
+MAX_UPTIME_SECONDS = 5 * 24 * 3600  # 5 days
 
 PLATFORM = platform.system()  # "Darwin", "Windows", or "Linux"
 IS_MACOS = PLATFORM == "Darwin"
@@ -83,10 +96,42 @@ else:
     DEFAULT_LOCAL_VOICE = "default"
 DEFAULT_GEMINI_VOICE = "Kore"
 
+# Tone presets for Gemini TTS. Each maps a tone name to a short delivery
+# description that's spliced into the style prompt in _speak_gemini(). "neutral"
+# preserves the original hardcoded delivery for backward compatibility.
+DEFAULT_TONE = "neutral"
+TONE_PRESETS = {
+    "neutral": (
+        "a clear, professional, encouraging tone suitable for a developer "
+        "receiving feedback from an AI assistant"
+    ),
+    "encouraging": (
+        "a warm, supportive, celebratory tone that cheers the listener on"
+    ),
+    "playful": (
+        "a light, fun tone with personality and a touch of humor"
+    ),
+    "serious": (
+        "a measured, focused, no-nonsense tone that stays on point"
+    ),
+    "excited": (
+        "an energetic, enthusiastic tone brimming with positive momentum"
+    ),
+    "calm": (
+        "a gentle, reassuring, unhurried tone that puts the listener at ease"
+    ),
+    "concise": (
+        "a brisk, efficient, matter-of-fact tone that wastes no words"
+    ),
+}
+
 CONFIG_DIR = Path.home() / ".levity-voice"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 COMMAND_FILE = CONFIG_DIR / "command.json"
 PID_FILE = CONFIG_DIR / "server.pid"
+# Held (flock) across the kill-stale → write-pid startup critical section so two
+# instances spawning simultaneously serialize instead of racing on the PID file.
+PID_LOCK_FILE = CONFIG_DIR / "server.pid.lock"
 ENV_FILE = CONFIG_DIR / ".env"
 # Touched whenever voice_speak runs; the Claude Code Stop hook reads this to
 # avoid double-speaking a turn the model already voiced (see hooks/).
@@ -282,13 +327,54 @@ def _kill_stale_instance() -> None:
 
 
 def _write_pid_file() -> None:
-    """Write our PID atomically (tmp → rename)."""
+    """Write our PID atomically (tmp → rename).
+
+    The temp file is per-PID (``server.pid.<pid>.tmp``) so two instances
+    spawning at the same moment never share one temp file — previously a shared
+    ``server.pid.tmp`` let instance A's ``replace()`` race instance B's, and the
+    loser hit FileNotFoundError and became an invisible orphan.
+    """
     try:
-        tmp = PID_FILE.with_suffix(".pid.tmp")
+        tmp = PID_FILE.with_name(f"server.pid.{os.getpid()}.tmp")
         tmp.write_text(str(os.getpid()))
         tmp.replace(PID_FILE)
     except OSError as exc:
         log.error("couldn't write PID file: %r", exc)
+
+
+@contextlib.contextmanager
+def _startup_lock():
+    """Serialize the startup PID critical section across processes via flock.
+
+    Two MCP hosts can spawn server.py within milliseconds of each other. Without
+    a cross-process lock, both run _kill_stale_instance + _write_pid_file
+    interleaved and one ends up an orphan with no PID-file ownership. An
+    advisory flock on PID_LOCK_FILE forces them to take turns: the second waits,
+    then sees the first's fresh PID file and (correctly) leaves it be or replaces
+    it cleanly. On Windows (no fcntl) or any lock error this degrades to a no-op
+    rather than blocking startup.
+    """
+    if fcntl is None:
+        yield
+        return
+    lock_fd = None
+    try:
+        lock_fd = os.open(str(PID_LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        log.warning("couldn't acquire startup lock (continuing unlocked): %r", exc)
+        if lock_fd is not None:
+            os.close(lock_fd)
+            lock_fd = None
+    try:
+        yield
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
 
 
 def _remove_pid_file() -> None:
@@ -430,6 +516,15 @@ def _reload_config_if_changed() -> None:
 _tts_lock = threading.RLock()       # serializes playback (RLock for fallback)
 _tts_process: subprocess.Popen | None = None
 _tts_proc_lock = threading.Lock()   # guards _tts_process reference
+
+# Monotonic counter bumped by every voice_speak. A background speak thread
+# checks it after acquiring _tts_lock and bails if a newer call has arrived,
+# so a request that lost the interrupt race (its predecessor hadn't yet
+# registered its subprocess when _kill_active_tts ran) can't replay stale
+# audio after the newest utterance. Leaf lock: never held while acquiring
+# another lock.
+_speak_gen = 0
+_speak_gen_lock = threading.Lock()
 
 
 def _kill_active_tts() -> None:
@@ -604,10 +699,15 @@ def _play_audio_file(filepath: str) -> None:
 
 
 def _speak_gemini(text: str, api_key: str, gemini_voice: str,
-                  local_voice: str) -> str:
-    """Tier 2: Gemini 2.5 Flash TTS. Falls back to local on any error."""
+                  local_voice: str, tone: str = DEFAULT_TONE) -> str:
+    """Tier 2: Gemini 2.5 Flash TTS. Falls back to local on any error.
+
+    `tone` selects a delivery style from TONE_PRESETS; an unknown tone falls
+    back to the neutral preset so callers can never break the style prompt."""
     if not api_key:
         return _speak_local(text, voice=local_voice)
+
+    style = TONE_PRESETS.get(tone, TONE_PRESETS[DEFAULT_TONE])
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -617,9 +717,7 @@ def _speak_gemini(text: str, api_key: str, gemini_voice: str,
         "contents": [{
             "parts": [{
                 "text": (
-                    "Read the following aloud in a clear, professional, "
-                    "encouraging tone suitable for a developer receiving "
-                    f"feedback from an AI assistant:\n\n{text}"
+                    f"Read the following aloud in {style}:\n\n{text}"
                 ),
             }],
         }],
@@ -660,7 +758,9 @@ def _speak_gemini(text: str, api_key: str, gemini_voice: str,
             if b64:
                 audio_b64 = b64
                 break
-    except (KeyError, IndexError, TypeError) as exc:
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        # AttributeError covers a candidate/part that isn't the dict we expect
+        # (e.g. a string), so a malformed response still falls back cleanly.
         log.error("Gemini parse error: %r", exc)
 
     if not audio_b64:
@@ -716,15 +816,26 @@ def _write_last_spoken(text: str) -> None:
 
 
 def _speak_background(text: str, use_cloud: bool, api_key: str,
-                      gemini_voice: str, local_voice: str) -> None:
+                      gemini_voice: str, local_voice: str,
+                      generation: int, tone: str = DEFAULT_TONE) -> None:
     """Run the (blocking) TTS in a background thread so voice_speak can return
     immediately — long replies must not keep the MCP request open long enough
-    to time out and silently drop the audio."""
+    to time out and silently drop the audio.
+
+    `generation` is the voice_speak sequence number this thread belongs to. We
+    serialize on _tts_lock and, once it's ours, bail if a newer voice_speak has
+    since arrived — that thread will speak instead, so we never replay audio
+    the user has already superseded."""
     try:
-        if use_cloud:
-            _speak_gemini(text, api_key, gemini_voice, local_voice)
-        else:
-            _speak_local(text, local_voice)
+        with _tts_lock:
+            with _speak_gen_lock:
+                superseded = generation != _speak_gen
+            if superseded:
+                return
+            if use_cloud:
+                _speak_gemini(text, api_key, gemini_voice, local_voice, tone)
+            else:
+                _speak_local(text, local_voice)
     except Exception as exc:
         log.error("background speak failed: %r", exc)
 
@@ -831,24 +942,29 @@ def _record_audio(window: float, silence_sec: float) -> str:
                 state["last_voice"] = time.time()
                 state["spoke"] = True
 
+    # Keep fd 1 muted for the ENTIRE time the PortAudio stream is live, not
+    # just around start/stop. CoreAudio (PaMacCore / AUHAL) can write
+    # diagnostics straight to fd 1 from its own thread at any point during
+    # capture, and a single stray byte mid-recording corrupts the stdio
+    # JSON-RPC stream (e.g. `Unexpected token '|', "||PaMacCor"...`), which
+    # disconnects the MCP server.
     with _silence_fd1():
         stream = _sd.InputStream(
             samplerate=MIC_SAMPLE_RATE, channels=1, dtype="float32",
             blocksize=MIC_BLOCK_SIZE, callback=_cb,
         )
         stream.start()
-    try:
-        while True:
-            time.sleep(0.05)
-            now = time.time()
-            with cb_lock:
-                elapsed = now - state["start"]
-                silence = (now - state["last_voice"]) if state["spoke"] else 0.0
-                spoke = state["spoke"]
-            if elapsed >= window or (spoke and silence >= silence_sec):
-                break
-    finally:
-        with _silence_fd1():
+        try:
+            while True:
+                time.sleep(0.05)
+                now = time.time()
+                with cb_lock:
+                    elapsed = now - state["start"]
+                    silence = (now - state["last_voice"]) if state["spoke"] else 0.0
+                    spoke = state["spoke"]
+                if elapsed >= window or (spoke and silence >= silence_sec):
+                    break
+        finally:
             try:
                 stream.stop()
                 stream.close()
@@ -934,7 +1050,8 @@ mcp = FastMCP(
         "openWorldHint": True,
     },
 )
-async def voice_speak(text: str, force_local: bool = False) -> str:
+async def voice_speak(text: str, force_local: bool = False,
+                      tone: str = DEFAULT_TONE) -> str:
     """Speak text aloud using two-tier TTS.
 
     Call this tool to read your reply aloud to the user.
@@ -943,9 +1060,23 @@ async def voice_speak(text: str, force_local: bool = False) -> str:
     Longer text with a Gemini key uses Gemini 2.5 Flash TTS.
     If voice response is toggled OFF, returns silently.
 
+    The `tone` shapes Gemini's delivery — match it to the moment so utterances
+    don't all sound the same. Available tones:
+      - "neutral"     — clear, professional delivery (default)
+      - "encouraging" — warm, supportive, celebratory (a fix landed, tests pass)
+      - "playful"     — light, fun, with personality (banter, easter eggs)
+      - "serious"     — measured, focused, no-nonsense (warnings, risky ops)
+      - "excited"     — energetic, enthusiastic (a big win, something shipped)
+      - "calm"        — gentle, reassuring, unhurried (errors, reassurance)
+      - "concise"     — brisk, efficient, matter-of-fact (quick status updates)
+    The tone only affects Gemini TTS; local 'say' ignores it. An unknown tone
+    falls back to "neutral".
+
     Args:
         text: The text to speak aloud.
         force_local: If True, always use macOS 'say' regardless of text length.
+        tone: Delivery style for Gemini TTS (see list above). Defaults to
+            "neutral".
 
     Returns:
         str: Status message indicating how the text was spoken.
@@ -969,13 +1100,19 @@ async def voice_speak(text: str, force_local: bool = False) -> str:
     # already voiced even while audio is still playing.
     _write_last_spoken(text)
 
-    # Interrupt any in-flight speech, then play in the BACKGROUND and return
-    # right away. Blocking until `say`/Gemini finished reading a long reply is
-    # what made the MCP request time out and silently drop the spoken response.
+    # Claim the newest-utterance slot, then interrupt any in-flight speech and
+    # play in the BACKGROUND, returning right away. Blocking until `say`/Gemini
+    # finished reading a long reply is what made the MCP request time out and
+    # silently drop the spoken response. The generation tag lets the background
+    # thread bail if an even newer voice_speak arrives before it gets the lock.
+    global _speak_gen
+    with _speak_gen_lock:
+        _speak_gen += 1
+        my_gen = _speak_gen
     _kill_active_tts()
     threading.Thread(
         target=_speak_background,
-        args=(text, use_cloud, api_key, gemini_voice, local_voice),
+        args=(text, use_cloud, api_key, gemini_voice, local_voice, my_gen, tone),
         daemon=True, name="levity-speak",
     ).start()
 
@@ -1151,6 +1288,19 @@ def _apply_toggle_action(action: str) -> str:
     )
 
 
+def _format_uptime() -> str:
+    """Uptime as days rounded to the nearest half day, e.g. "1.5 days".
+
+    Uses "day" only for exactly 1, "days" otherwise (incl. 0.5).
+    """
+    days = (time.time() - _server_started_at) / 86400.0
+    half_days = round(days * 2) / 2  # nearest 0.5
+    unit = "day" if half_days == 1 else "days"
+    # Drop the trailing ".0" so whole numbers read "2 days" not "2.0 days".
+    value = int(half_days) if half_days == int(half_days) else half_days
+    return f"{value} {unit}"
+
+
 @mcp.tool(
     name="voice_toggle",
     annotations={
@@ -1193,6 +1343,7 @@ async def voice_toggle(action: str) -> str:
                 "auto_menubar": snap.get("auto_menubar", True),
                 "platform": PLATFORM,
                 "build": BUILD,
+                "uptime": _format_uptime(),
             }, indent=2)
         return await asyncio.to_thread(_get_status)
 
@@ -1352,6 +1503,45 @@ _command_watcher_thread: threading.Thread | None = None
 # ---------------------------------------------------------------------------
 
 
+def _auto_restore() -> None:
+    """If config says server_active, ensure in-memory state matches."""
+    time.sleep(3)  # let MCP event loop start
+    try:
+        with _lock:
+            if _config.get("server_active", False):
+                log.info("auto-restoring server_active from config")
+                _config["server_active"] = True
+    except Exception as exc:
+        log.error("auto-restore failed: %r", exc)
+
+
+def _uptime_watchdog() -> None:
+    """Re-exec the process once uptime exceeds MAX_UPTIME_SECONDS.
+
+    Long-running daemons accumulate audio/TTS state drift; a periodic fresh
+    start keeps things healthy. Polls hourly; once over the ceiling it cleans
+    up (removes our PID file, kills any in-flight TTS) and replaces the process
+    in place via os.execv so the menu bar / MCP transport sees a seamless
+    restart.
+    """
+    while not _shutdown_flag:
+        time.sleep(3600)  # check hourly
+        if _shutdown_flag:
+            return
+        try:
+            if time.time() - _server_started_at > MAX_UPTIME_SECONDS:
+                log.info("Auto-restart: uptime exceeded 5 days, restarting...")
+                for handler in log.handlers:
+                    handler.flush()
+                # Clean up before handing the slot to the fresh process.
+                _remove_pid_file()
+                _kill_active_tts()
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+                return  # os.execv replaces the image; defensively stop anyway
+        except Exception as exc:
+            log.error("uptime watchdog failed: %r", exc)
+
+
 def _maybe_launch_menubar() -> None:
     """Launch the macOS menu-bar app on startup (opt-in via auto_menubar).
 
@@ -1406,8 +1596,11 @@ def _graceful_shutdown(signum, _frame):
 if __name__ == "__main__":
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    _kill_stale_instance()
-    _write_pid_file()
+    # Serialize kill-stale + write-pid so two instances spawning at once can't
+    # interleave and orphan one of them (see _startup_lock / _write_pid_file).
+    with _startup_lock():
+        _kill_stale_instance()
+        _write_pid_file()
 
     log.info("server started (platform=%s, pid=%d)", PLATFORM, os.getpid())
 
@@ -1415,6 +1608,19 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _graceful_shutdown)
 
     _start_command_watcher()
+    threading.Thread(
+        target=_auto_restore, daemon=True, name="levity-auto-restore"
+    ).start()
+    threading.Thread(
+        target=_uptime_watchdog, daemon=True, name="levity-uptime-watchdog"
+    ).start()
     _maybe_launch_menubar()
 
-    mcp.run()
+    # On a clean transport close, mcp.run() returns and we remove our own PID
+    # file (the guard in _remove_pid_file no-ops if a newer instance already
+    # took ownership). Signal-driven exits still go through _graceful_shutdown,
+    # which deliberately skips this and leaves cleanup to the next startup.
+    try:
+        mcp.run()
+    finally:
+        _remove_pid_file()
